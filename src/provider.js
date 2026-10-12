@@ -18,6 +18,7 @@ class Provider {
     this.fixedSource = fixed.startsWith("__") ? "" : fixed;
     this.sourceCache = null;
     this.sourceCacheAt = 0;
+    this.token = null; // JWT, only in Suwayomi's ui_login mode
   }
 
   getSettings() {
@@ -42,23 +43,52 @@ class Provider {
     return this.serverUrl + (path.startsWith("/") ? "" : "/") + path;
   }
 
-  async gql(query, variables) {
+  // ui_login mode (Suwayomi multi-user) ignores Basic auth on the GraphQL API: log in for a JWT.
+  async login() {
+    const data = await this.post(
+      "mutation($u: String!, $p: String!) { login(input: { username: $u, password: $p }) { accessToken } }",
+      { u: this.username, p: this.password }, {});
+    if (data.unauthorized) throw new Error(`Suwayomi login refused (${this.serverUrl})`);
+    this.token = data.login.accessToken;
+  }
+
+  async post(query, variables, auth) {
     let res;
     try {
       res = await fetch(`${this.serverUrl}/api/graphql`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json", ...this.authHeaders() },
+        headers: { "Content-Type": "application/json", Accept: "application/json", ...auth },
         body: JSON.stringify({ query, variables: variables || {} }),
       });
     } catch (e) {
       throw new Error(`Suwayomi is not reachable at ${this.serverUrl} — is the "Suwayomi Launcher" plugin running? (${e})`);
     }
-    if (!res.ok) throw new Error(`Suwayomi HTTP ${res.status} (${this.serverUrl})`);
-    const json = await res.json();
+    // Seanime's runtime may return json() synchronously, so no .catch() chaining here.
+    let json = null;
+    if (res.status !== 401) {
+      try { json = await res.json(); } catch (e) { json = null; }
+    }
+    if (res.status === 401 || (json && json.errors && json.errors.some(e => /unauthori[sz]ed/i.test(e.message)))) {
+      return { unauthorized: true };
+    }
+    if (!res.ok || !json) throw new Error(`Suwayomi HTTP ${res.status} (${this.serverUrl})`);
     if (json.errors && json.errors.length) {
       throw new Error("Suwayomi: " + json.errors.map(e => e.message).join("; "));
     }
     return json.data;
+  }
+
+  async gql(query, variables) {
+    const auth = () => (this.token ? { Authorization: `Bearer ${this.token}` } : this.authHeaders());
+    let data = await this.post(query, variables, auth());
+    // Access tokens are short-lived (server.jwtTokenExpiry, 5 min by default): log in again once.
+    if (data.unauthorized && this.username) {
+      this.token = null;
+      await this.login();
+      data = await this.post(query, variables, auth());
+    }
+    if (data.unauthorized) throw new Error(`Suwayomi HTTP 401 (${this.serverUrl}): set the username and password`);
+    return data;
   }
 
   splitList(s) {
@@ -238,6 +268,9 @@ class Provider {
     // Non-empty headers make Seanime load pages through its own image proxy. The reader in the
     // browser can't reach 127.0.0.1:4567 directly, but the Seanime server can.
     const headers = { Accept: "image/*", ...this.authHeaders() };
-    return pages.map((p, index) => ({ url: this.absUrl(p), index, headers }));
+    // In ui_login mode the page endpoint accepts Basic auth (admin only) when opds=true; access
+    // tokens expire in minutes, too soon for a long chapter.
+    const suffix = this.token ? (p => (p.includes("?") ? "&" : "?") + "opds=true") : () => "";
+    return pages.map((p, index) => ({ url: this.absUrl(p) + suffix(p), index, headers }));
   }
 }
